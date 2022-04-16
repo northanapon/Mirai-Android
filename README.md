@@ -71,78 +71,86 @@
         - `text`: OCR text based on the `type`.
     - `fullImage`: A bitmap image of the full frame used during scanning.
     - `croppedImage`: A bitmap image of the card. This is available if `isFrontSide` is `true`.
+    - `faceOnCardImage`: A bitmap image of the face on the card. This is available if `isFrontSide` is `true`.
     - `classificationResult`: A result from ML image labeling, available if `isFrontCardFull` is `true`.
 	  - `confidence`: A confidence value from 0 to 1. Higher values mean the images are more likely to be good quality. The threshold of `0.6` to `0.9` is recommended. 
 	  - `error`: An object for error messages.
 
     ```kotlin
     private fun displayResult(result: IDCardResult) {
-          result.error?.run {
-              resultText.text = errorMessage
-          }
-          boundingBoxOverlay.post{boundingBoxOverlay.clearBounds()}
-          val bboxes: MutableList<Rect> = mutableListOf()
-          var mlBBox: Rect? = null
-          result.run {
-              // fullImage is always available.
-              val capturedImage = fullImage
-  
-              confidenceText.text = "%.3f ".format(confidence)
-              if (this.detectResult != null) {
-                  confidenceText.text = "%.3f (%.3f) (%.3f)".format(
-                      confidence,
-                      this.detectResult!!.mlConfidence,
-                      this.detectResult!!.boxConfidence)
-                  if (this.detectResult!!.cardBoundingBox != null) {
-                      mlBBox = this.detectResult!!.cardBoundingBox!!.transform()
-                  }
-              }
-              if (isFrontSide != null && isFrontSide as Boolean) {
-                  // cropped image is only available for front side scan result.
-                  val cardImage = croppedImage
-                  confidenceText.text = "%s, Full: %s".format(confidenceText.text, isFrontCardFull)
-  
-                  if (classificationResult != null && classificationResult!!.error == null) {
-                      confidenceText.text = "%s (%.3f)".format(confidenceText.text, classificationResult!!.confidence)
-                  }
-              }
-  
-              if (texts != null) {
-                  resultText.text = "TEXTS -> ${texts!!.joinToString("\n")}, isFrontside -> $isFrontSide"
-              } else {
-                  resultText.text = "TEXTS -> NULL, isFrontside -> $isFrontSide"
-              }
-              if (idBBoxes != null) {
-                  bboxes.addAll(idBBoxes!!)
-              }
-              if (cardBox != null) {
-                  bboxes.add(cardBox!!)
-              }
-              boundingBoxOverlay.post{boundingBoxOverlay.drawBounds(
-                 bboxes.map{it.transform()}, mlBBox)}
-          }
-      }
+        result.run {
+            // Indicator for front side of the card (true means front).
+            val isFrontSide = isFrontSide
+            // Indicator for front side of the card and fully capture (true means front and fuull).
+            val isFrontCardFull = isFrontCardFull
+            // fullImage is always available.
+            val capturedImage = fullImage
+            // cropped image is only available for front side scan result.
+            val cardImage = croppedImage
+            // face image (right-bottom corner is only available for front size scan result.
+            val faceOnCardImage = faceImage
+            // confidence 1: readable information on card
+            val confidenceByInfo = confidence
+            // confidence 2: ML-based confidence
+            val confidenceByML = classificationResult?.confidence
+            // text data
+            val textData = texts
+            // error
+            val error = error
+        }
+    }
       ```
 
 ### Example Code
 
 ```kotlin
-@androidx.camera.core.ExperimentalGetImage
-class MainActivity : AppCompatActivity() {
+package work.indistinct.mirai.demo
 
+import work.indistinct.mirai.CardImage
+import work.indistinct.mirai.IDCardResult
+import work.indistinct.mirai.Mirai
+import android.Manifest
+import android.content.pm.PackageManager
+import android.graphics.Rect
+import android.os.Build
+import android.os.Bundle
+import android.widget.Button
+import android.widget.Switch
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import android.widget.Toast
+import kotlinx.android.synthetic.main.activity_main.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+@androidx.camera.core.ExperimentalGetImage
+class MainActivity : AppCompatActivity(), Mirai.OnInitializedListener {
+
+    lateinit var swapCameraButton: Button
     lateinit var resultText: TextView
     lateinit var confidenceText: TextView
+    lateinit var faceText: TextView
+    lateinit var faceDetectionSwitch: Switch
 
     private var preview: Preview? = null
     private var imageCapture: ImageCapture? = null
     private var imageAnalyzer: ImageAnalysis? = null
     private var camera: Camera? = null
+    private var lensFacing: Int = CameraSelector.LENS_FACING_BACK
     private var cameraProvider: ProcessCameraProvider? = null
 
     private var previewWidth: Int = 1
     private var previewHeight: Int = 1
     private var imgProxyWidth: Int = 1
     private var imgProxyHeight: Int = 1
+    private var imgProxyRotationDegree: Int = 0
     private lateinit var cameraExecutor: ExecutorService
 
     companion object {
@@ -153,10 +161,16 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        Mirai.init(this, "68OvRGckCYiElYRqMqv7")
+        Mirai.init(this,"ajMbRHTFPtUo9RzpSAMd", this)
 
         resultText = findViewById(R.id.resultTextView)
         confidenceText = findViewById(R.id.confidenceTextView)
+        swapCameraButton = findViewById(R.id.swapCameraButton)
+        faceText = findViewById(R.id.faceTextView)
+        faceDetectionSwitch = findViewById(R.id.faceDetectionSwitch)
+        swapCameraButton.setOnClickListener {
+            swapCamera()
+        }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -164,8 +178,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    }
+
+    override fun onCompleted() {
+        Toast.makeText(this, "Init Completed", Toast.LENGTH_LONG).show()
         cameraExecutor = Executors.newSingleThreadExecutor()
         setupCamera()
+    }
+
+    override fun onError(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private fun setupCamera() {
@@ -180,21 +202,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun bindCameraUseCases() {
-        val cameraSelector = CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
+        val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
-        val metrics = DisplayMetrics().also { previewView.display.getRealMetrics(it) }
+//        val metrics = DisplayMetrics().also { previewView.display.getRealMetrics(it) }
 
-        val screenAspectRatio = aspectRatio(metrics.widthPixels, metrics.heightPixels)
-
+//        val screenAspectRatio = aspectRatio(metrics.widthPixels, metrics.heightPixels)
+        previewView.scaleType = PreviewView.ScaleType.FIT_START
         val rotation = previewView.display.rotation
 
 //        val previewChild = previewView.getChildAt(0)
         previewWidth = (previewView.width * previewView.scaleX).toInt()
         previewHeight = (previewView.height * previewView.scaleY).toInt()
+        val screenAspectRatio = aspectRatio(previewWidth, previewHeight)
 
         preview = Preview.Builder()
             .setTargetRotation(rotation)
+            .setTargetAspectRatio(screenAspectRatio)
             .build()
+
 
         imageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
@@ -213,10 +238,20 @@ class MainActivity : AppCompatActivity() {
                         val reverseDimens = imageInfo.rotationDegrees == 90 || imageInfo.rotationDegrees == 270
                         imgProxyWidth = if (reverseDimens) imageProxy.height else imageProxy.width
                         imgProxyHeight = if (reverseDimens) imageProxy.width else imageProxy.height
+                        imgProxyRotationDegree = imageInfo.rotationDegrees
                         val card = CardImage(this.image!!, imageInfo.rotationDegrees)
-                        Mirai.scanIDCard(card) {result ->
+                        Mirai.scanIDCard(card) { result ->
                             this@MainActivity.displayResult(result)
                             imageProxy.close()
+//                            if (faceDetectionSwitch.isChecked) {
+//                                Mirai.checkFace(result) { faceResult ->
+//                                    this@MainActivity.displayResult(result, faceResult)
+//                                    imageProxy.close()
+//                                }
+//                            } else {
+//                                this@MainActivity.displayResult(result, null)
+//                                imageProxy.close()
+//                            }
                         }
                     }
                 }
@@ -236,51 +271,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun displayResult(result: IDCardResult) {
-        result.error?.run {
-            resultText.text = errorMessage
+    private fun swapCamera() {
+        cameraProvider?.unbindAll()
+        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+            CameraSelector.LENS_FACING_FRONT
+        } else {
+            CameraSelector.LENS_FACING_BACK
         }
-        boundingBoxOverlay.post{boundingBoxOverlay.clearBounds()}
-        val bboxes: MutableList<Rect> = mutableListOf()
-        var mlBBox: Rect? = null
-        result.run {
-            // fullImage is always available.
-            val capturedImage = fullImage
-
-            confidenceText.text = "%.3f ".format(confidence)
-            if (this.detectResult != null) {
-                confidenceText.text = "%.3f (%.3f) (%.3f)".format(
-                    confidence,
-                    this.detectResult!!.mlConfidence,
-                    this.detectResult!!.boxConfidence)
-                if (this.detectResult!!.cardBoundingBox != null) {
-                    mlBBox = this.detectResult!!.cardBoundingBox!!.transform()
-                }
-            }
-            if (isFrontSide != null && isFrontSide as Boolean) {
-                // cropped image is only available for front side scan result.
-                val cardImage = croppedImage
-                confidenceText.text = "%s, Full: %s".format(confidenceText.text, isFrontCardFull)
-
-                if (classificationResult != null && classificationResult!!.error == null) {
-                    confidenceText.text = "%s (%.3f)".format(confidenceText.text, classificationResult!!.confidence)
-                }
-            }
-
-            if (texts != null) {
-                resultText.text = "TEXTS -> ${texts!!.joinToString("\n")}, isFrontside -> $isFrontSide"
-            } else {
-                resultText.text = "TEXTS -> NULL, isFrontside -> $isFrontSide"
-            }
-            if (idBBoxes != null) {
-                bboxes.addAll(idBBoxes!!)
-            }
-            if (cardBox != null) {
-                bboxes.add(cardBox!!)
-            }
-            boundingBoxOverlay.post{boundingBoxOverlay.drawBounds(
-               bboxes.map{it.transform()}, mlBBox)}
-        }
+        bindCameraUseCases()
     }
 
     private fun aspectRatio(width: Int, height: Int): Int {
@@ -291,20 +289,47 @@ class MainActivity : AppCompatActivity() {
         return AspectRatio.RATIO_16_9
     }
 
+    private fun displayResult(result: IDCardResult) {
+        result.run {
+            // Indicator for front side of the card (true means front).
+            val isFrontSide = isFrontSide
+            // Indicator for front side of the card and fully capture (true means front and fuull).
+            val isFrontCardFull = isFrontCardFull
+            // fullImage is always available.
+            val capturedImage = fullImage
+            // cropped image is only available for front side scan result.
+            val cardImage = croppedImage
+            // face image (right-bottom corner is only available for front size scan result.
+            val faceOnCardImage = faceImage
+            // confidence 1: readable information on card
+            val confidenceByInfo = confidence
+            // confidence 2: ML-based confidence
+            val confidenceByML = classificationResult?.confidence
+            // text data
+            val textData = texts
+            // error
+            val error = error
 
-    private fun Rect.transform(): Rect {
-        val scaleX = previewWidth / imgProxyWidth.toFloat()
-        val scaleY = previewHeight / imgProxyHeight.toFloat()
+            if (error != null) {
+                resultText.text = "ERROR: ${error.errorMessage}"
+                return
+            }
 
-        val flippedLeft = left
-        val flippedRight = right
-        // Scale all coordinates to match preview
-        val scaledLeft = scaleX * flippedLeft
-        val scaledTop = scaleY * top
-        val scaledRight = scaleX * flippedRight
-        val scaledBottom = scaleY * bottom
-        return Rect(scaledLeft.toInt(), scaledTop.toInt(), scaledRight.toInt(), scaledBottom.toInt())
+            if (textData != null) {
+                resultText.text = "TEXTS -> ${textData!!.joinToString("\n")}, isFrontside -> $isFrontSide"
+            } else {
+                resultText.text = "TEXTS -> NULL, isFrontside -> $isFrontSide"
+            }
+
+            confidenceText.text = "%.3f ".format(confidenceByInfo)
+            if (isFrontSide != null && isFrontSide as Boolean) {
+                // cropped image is only available for front side scan result.
+                confidenceText.text = "%s, Full: %s".format(confidenceText.text, isFrontCardFull)
+
+                if (classificationResult != null && classificationResult!!.error == null) {
+                    confidenceText.text = "%s (%.3f)".format(confidenceText.text, confidenceByML)
+                }
+            }
+        }
     }
-}
-
 ```
